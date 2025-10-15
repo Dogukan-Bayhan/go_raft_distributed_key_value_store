@@ -48,3 +48,5 @@ type AppendEntriesResponse struct {
 	Success bool
 	LastIndex uint64
 }
+
+

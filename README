@@ -1,0 +1,352 @@
+Süper hedef: Raft tabanlı, mTLS korumalı, lineerleştirilebilir okuma destekli (ReadIndex/lease), snapshot’lı ve log-kompakt, Docker/Kubernetes’te ölçeklenebilir bir dağıtık KV-store. Aşağıda “başlangıç → üretim”e kadar sıralı bir plan, modül kırılımı, performans reçetesi, test/benchmark planı ve container/cluster kurulum adımları var. Mümkün olduğunca stdlib + syscalls kullanıyorum.
+
+0) Yol haritası (sıra sıra)
+
+MVP Raft çekirdeği (tek dosya, tek süreç, in-mem log): Follower/Candidate/Leader, RequestVote & AppendEntries, seçim/heartbeat zamanlayıcıları, çoğunlukla commit kuralı, apply kanalı.
+
+Kalıcı WAL + fsync: Append-only segment dosyaları, term/idx meta, CRC32, unix.Fsync, crash-recovery.
+
+Snapshot & InstallSnapshot: Log budama, state machine snapshot/restore akışı.
+
+Net protokolü (stdlib): net.TCPConn üstünde kendi ikili protokolün (length-prefixed). Sabit bağlantılar, pipelining. (İlk iterasyonda net/rpc+gob da olur; performans için binary protokole geç.)
+
+KV FSM: Apply([]byte) -> []byte arabirimi; PUT/GET/DEL; snapshot/restore.
+
+Read consistency: ReadIndex (ya da lider lease) ile lineer okuma; follower’dan okumalarda lider yönlendirmesi.
+
+Üyelik değişimi (joint consensus): Add/Remove node; konfig term/log girdileri.
+
+İstemci kütüphanesi: Lider keşfi + yeniden deneme, idempotent write’lar için client command ID, backoff.
+
+Güvenlik: İç trafik için mTLS (crypto/tls), istemci için mTLS veya HMAC imzalı token (stdlib: crypto/hmac/sha256).
+
+Test matrisi + failure injection: Zaman, ağ, disk hataları; fuzzing.
+
+Benchmark & pprof: Yük senaryoları, mikros/makrolar; net/http/pprof, expvar.
+
+Docker & K8s: Minimal image, StatefulSet + Headless Service, readiness/liveness, config.
+
+1) Paket/Modül yapısı
+/cmd/raftd          # node binary (flags: --id, --data-dir, --join, --peers, --tls...)
+/pkg/raft           # Raft çekirdeği (event loop, RPC message types, timers)
+/pkg/storage        # WAL + snapshot (segment yönetimi, fsync, CRC)
+/pkg/transport      # TCP tabanlı protokol (client/server), mTLS sarmalayıcı
+/pkg/fsm            # KV state machine (map + snapshot), future: disk tabanlı
+/pkg/client         # Cluster client (leader discovery, retries, ReadIndex)
+/pkg/api            # (opsiyonel) HTTP admin endp. (metrics/pprof/health)
+/deploy             # Dockerfile, k8s yaml’ları, helm (opsiyon)
+/bench              # benchmark araçları (loadgen, latency tracker)
+/internal/testkit   # fault injection, deterministic clock arayüzleri
+
+2) Çekirdek Raft tasarımı (net/stdlib ağırlıklı)
+Temel durum & değişkenler
+
+currentTerm, votedFor, log[] (entry: {term, index, type, data})
+
+commitIndex, lastApplied
+
+Liderde: nextIndex[N], matchIndex[N]
+
+Zamanlayıcılar: electionTimeout (örn. 300–600ms arası random), heartbeatInterval (örn. 50–100ms)
+
+Tek raft event loop (tek goroutine) + kanal tabanlı mesajlaşma → basit kilit modeli.
+
+RPC’ler (kendi protokolün)
+
+RequestVote(term, candidateId, lastLogIndex, lastLogTerm) -> (term, voteGranted)
+
+AppendEntries(term, leaderId, prevLogIndex, prevLogTerm, entries[], leaderCommit) -> (term, success, lastIndex)
+
+InstallSnapshot(term, leaderId, lastIncludedIndex, lastIncludedTerm, chunk...)
+
+Apply yolu
+
+Commit ilerledikçe FSM.Apply(cmd) çağır; cevapları applyCh ile üst katmana döndür.
+
+Entry türleri: NormalCommand, ConfChange, Barrier/ReadIndex, SnapshotMarker.
+
+ReadIndex (lineer okuma)
+
+Lider, bir barrier (empty AppendEntries) ile kendi term’inde çoğunluğa ulaşmış son index’i döndürür; istemci GET’i bu index ≥ commitIndex olduğunda servis edilir. (Alternatif: kısa vadede leader lease; cluster saat drift’lerini gözet.)
+
+3) Depolama (stdlib + syscalls)
+WAL (append-only segmentler)
+
+Dosya adı: wal-<firstIndex>-<lastIndex>.log
+
+Kayıt formatı: [len|type|term|index|crc|payload] (len = 4/8 byte, network byte order)
+
+Yazım: bufio.Writer ile batch, ardından unix.Fsync(fd); meta (currentTerm, votedFor) için ayrı küçük dosya + fsync.
+
+CRC32 (hash/crc32) ile bozulma tespiti; truncation on recovery.
+
+Snapshot
+
+snap-<lastIncludedIndex>-<term>.bin
+
+Atomic replace: tmp yaz → unix.Fsync → rename
+
+Snapshot sonra < lastIncludedIndex log segmentlerini sil/truncate; InstallSnapshot ile follower’a parça parça gönder.
+
+Not: Daha ileri için x/sys/unix ile O_DIRECT veya pwritev varyantları (Linux) denenebilir; taşınabilirlik için opsiyon olarak tut.
+
+4) Transport (stdlib odaklı)
+
+İkili protokol: her mesaj uint32 length + type + payload (protobuf yoksa encoding/binary + kendi struct’ların).
+
+Kalıcı TCP bağlantıları (peer başına 1 gidiş 1 geliş kanal): reconnect/backoff.
+
+TCP_NODELAY aç (Nagle kapalı) → replike latency.
+
+Heartbeat ve AppendEntries’leri pipeline et (ACK beklemeden sıradaki paketi uçur).
+
+mTLS (crypto/tls) sarmala: tls.Config{ MinVersion: TLS1.3, ClientAuth: RequireAndVerifyClientCert }.
+
+5) KV State Machine
+
+Başlangıç: basit in-mem map[string][]byte + ince-taneli lock gerekmez (apply tek goroutineda).
+
+Snapshot: map’i gob yerine binary dump (keyLen|key|valLen|val); bufio.Writer ile.
+
+Gelecek: disk tabanlı KV (segment-+index), ama ilk hedef Raft doğruluğu.
+
+6) Üyelik değişimi (Joint Consensus)
+
+ConfChange{Add/Remove, NodeID, Addr} entry’si.
+
+Joint stage: Eski∪Yeni çoğunluk → commit; sonra final config’e geç.
+
+K8s/operasyonda tek tek node ekle/çıkar; eşzamanlı çoklu değişimden kaçın.
+
+7) İstemci kütüphanesi (pkg/client)
+
+Lider keşfi: Bootstrapped peers list → kısa bir WhoIsLeader RPC (ya da AppendEntries redirect kodu).
+
+Write path: Propose(cmd) → lider’e yolla → apply cevabını future/promise yapısıyla beklet.
+
+Read path: varsayılan linearizable: ReadIndex() → sonra GET (lider). (İsteğe bağlı stale read follower’dan).
+
+Retry/backoff: network hatası → diğer olası liderlere sırayla.
+
+Idempotency: ClientCommandID (UUID); duplicate commit durumunda aynı response’ı döndür.
+
+8) Güvenlik
+
+mTLS tüm node-lar arası; istemci → sunucu da tercihen mTLS.
+
+Alternatif istemci auth: Authorization: HMAC keyId:signature:nonce:ts (replay koruması için ts + nonce cache).
+
+Diskte şifreleme gerekecekse opsiyonel: crypto/aes ile per-segment AES-GCM (anahtar yönetimi dış kapsam).
+
+Log/snapshot’ta kişisel veri yok; loglarda data payload’ı sansürle (opsiyonel).
+
+9) Performans reçetesi (pratik ipuçları)
+
+Timer jitter: ElectionTimeout’u geniş aralıkta randomla; heartbeat küçük ve sabit.
+
+Batching & pipelining: AppendEntries’te birden fazla entry; ACK gelmeden yenisini gönder.
+
+Preallocation: Encode buffer’ları yeniden kullan (sync.Pool), bytes.Buffer yerine elde tutulan []byte.
+
+Zero-copy eğilim: io.ReaderFrom/WriterTo varsa kullan; io.ReadFull; bufio.Writer büyük buffer (>= 64KB).
+
+GC baskısı azalt: Hot path’te map alloc ve interface{} kaçın; encoding/binary ile düz byte yaz.
+
+Disk fsync sayısı: Her entry’de değil; grup commit (örn. 1ms window veya N entry).
+
+TCP ayarları: SetNoDelay(true); keepalive açık; tek bağlantı başına tek writer goroutine.
+
+Locking modeli: Raft çekirdeği tek goroutine; dış dünya kanal ile beslesin → data yarışları biter.
+
+Read path’i hızlandır: ReadIndex için heartbeat’i piggyback et; lease mode’da (tek AZ) RTT tasarrufu.
+
+Snapshot boyutu: Arka planda chunk’la; apply yolunu bloklama.
+
+Profiling: pprof CPU/heap; sıcak fonksiyonları inlined/allocs düşür.
+
+10) Test stratejisi (doğruluk önce)
+
+Birim testleri
+
+Seçim: tek lider; partition sonra yeniden birleşme (old leader step-down).
+
+Log eşleşme: çakışan entry overwrite; commit rule (leader term’inde çoğunluk).
+
+Snapshot/restore: eski log budaması + follower catch-up via InstallSnapshot.
+
+ReadIndex/lease doğruluğu.
+
+Fault injection / entegrasyon
+
+Saat soyutlayın (Clock arayüzü) → deterministik testler.
+
+Ağ soyutlayın: drop/dupe/reorder/delay; partition senaryoları.
+
+Disk: fsync başarısız, partial write, crash-recovery (mid-record truncation).
+
+Fuzz: testing/fuzz ile rasgele RPC dizileri.
+
+Araçlar
+
+-race her testte.
+
+Long-run “soak” (saatlerce düşük yük + ara sıra partition).
+
+Correctness oracle
+
+Tek process’te “altın model” KV (sıralı) çalıştır; cluster sonuçları ile tutarlılığı kıyasla.
+
+11) Benchmark planı
+
+Mikro:
+
+WAL append throughput (MB/s), fsync latency dağılımı.
+
+AppendEntries encode/decode ns/op, allocs/op.
+
+ReadIndex RTT (p99).
+
+Makro (3–5 node cluster):
+
+Yük: write-heavy (PUT), read-heavy (GET), mixed (80/20).
+
+İstemci sayısı/iş parçası skalası; p50/p95/p99 latency & ops/s.
+
+Failover’da (lider kill) RTO ölç (yeniden seçim süresi).
+
+Araç: kendi bench/loadgen (stdlib net), ölçüm için expvar counters.
+
+12) Gözlemlenebilirlik
+
+Metrics (stdlib): expvar (raft.term, commit_index, rpc_in/out, fsync_ms_hist bins).
+
+Tracing: runtime/trace (isteğe bağlı).
+
+Logs: yapılandırılmış (basit key=value), seviyeler (RAFD=debug env ile).
+
+pprof: net/http/pprof admin port (mTLS/localhost).
+
+13) Docker & Kubernetes
+
+Dockerfile (multi-stage, pure Go):
+
+# build
+FROM golang:1.22 AS build
+WORKDIR /src
+COPY . .
+RUN CGO_ENABLED=0 go build -o /out/raftd ./cmd/raftd
+
+# run
+FROM gcr.io/distroless/static:nonroot
+COPY --from=build /out/raftd /raftd
+USER nonroot:nonroot
+ENTRYPOINT ["/raftd"]
+
+
+K8s (StatefulSet + Headless Service özet):
+
+Headless Service: cluster.local DNS ile raft-0.raft-headless, raft-1...
+
+StatefulSet (replicas=3/5), her node’a --id=$(HOSTNAME); peer adreslerini RAFT_SEED env ile ver.
+
+readinessProbe: kendi /health?min_leader_since=... veya “last contact” metriği.
+
+PersistentVolume: data-dir mount.
+
+mTLS secret: server.crt/key, ca.crt (init-container ile dağıtım/yenileme).
+
+14) Minimal arayüz iskeletleri (yön gösterici)
+// pkg/raft/types.go
+type EntryType uint8
+const (
+    EntryNormal EntryType = iota
+    EntryConfChange
+    EntryBarrier // ReadIndex
+)
+
+type Entry struct {
+    Term  uint64
+    Index uint64
+    Type  EntryType
+    Data  []byte
+}
+
+// pkg/raft/node.go
+type Node interface {
+    Propose(cmd []byte) (Future, error)
+    ReadIndex(ctx context.Context) (uint64, error)
+    ApplyCh() <-chan ApplyResult
+}
+
+// pkg/storage/storage.go
+type WAL interface {
+    Append(entries []Entry) error
+    Sync() error
+    Iter(fromIdx uint64) (Iterator, error)
+    Truncate(toIdx uint64) error
+}
+type SnapshotStore interface {
+    Save(idx, term uint64, r io.Reader) error
+    LoadLatest() (idx, term uint64, r io.ReadCloser, err error)
+}
+
+// pkg/fsm/fsm.go
+type FSM interface {
+    Apply(cmd []byte) ([]byte, error)
+    Snapshot(w io.Writer) error
+    Restore(r io.Reader) error
+}
+
+15) Sıradaki görev listesi (hemen başlayalım)
+
+Sprint 1 (çekirdek & in-mem):
+
+ Tek dosya raft loop: seçim, heartbeat, vote & append RPC mock’ları.
+
+ Basit transport (localhost loopback) ile 3 node çalıştır; lider seçimi testi.
+
+ Propose → commit → ApplyCh akışı.
+
+Sprint 2 (WAL & recovery):
+
+ Segmentli WAL, CRC, fsync; meta dosyası.
+
+ Crash-recovery testleri (ortada kesilme, powerloss simülasyonu).
+
+ AppendEntries çakışma çözümü + overwrite testleri.
+
+Sprint 3 (snapshot & install):
+
+ FSM snapshot/restore; InstallSnapshot akışı.
+
+ Log budama ve yeniden başlatma doğrulaması.
+
+Sprint 4 (transport & mTLS):
+
+ TCP binary protokol (length-prefix), kalıcı bağlantı, pipeline ACK.
+
+ mTLS yapılandırması, cert reload opsiyonel.
+
+Sprint 5 (ReadIndex & client lib):
+
+ Barrier/ReadIndex implementasyonu.
+
+ pkg/client ile lider keşfi ve retry.
+
+ Linearizable GET’ler.
+
+Sprint 6 (conf change & ops):
+
+ Joint consensus; node ekle/çıkar testleri.
+
+ expvar/pprof, health endpoints; log seviyeleri.
+
+Sprint 7 (bench & k8s):
+
+ Mikro/makro benchmarklar, raporlar.
+
+ Dockerfile, StatefulSet + Headless Service yaml; readiness.
+
+ Failover RTO ölçümü & optimizasyonları.
+
+İstersen bir sonraki adım olarak Sprint 1’in iskelet kodlarını (raft event loop + zamanlayıcı + bellek içi log) çıkarayım; ardından adım adım WAL’a bağlayalım. Bu planla net bir şekilde MVP’den üretime giden yolu kapatıyoruz ve her aşamada hem doğruluğu hem performansı ölçüyoruz.

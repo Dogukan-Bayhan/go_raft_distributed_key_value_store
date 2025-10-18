@@ -151,7 +151,10 @@ func (n *Node) heartbeatTick() <- chan time.Time {
 }
 
 func (n *Node) startElection() {
-
+	if n.Role == Leader {
+		n.resetElection()
+		return
+	}
 	term := atomic.AddUint64(&n.CurrentTerm, 1)
 	n.Role = Candidate
 	n.VotedFor = n.Id

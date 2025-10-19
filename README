@@ -1,5 +1,3 @@
-Süper hedef: Raft tabanlı, mTLS korumalı, lineerleştirilebilir okuma destekli (ReadIndex/lease), snapshot’lı ve log-kompakt, Docker/Kubernetes’te ölçeklenebilir bir dağıtık KV-store. Aşağıda “başlangıç → üretim”e kadar sıralı bir plan, modül kırılımı, performans reçetesi, test/benchmark planı ve container/cluster kurulum adımları var. Mümkün olduğunca stdlib + syscalls kullanıyorum.
-
 0) Yol haritası (sıra sıra)
 
 MVP Raft çekirdeği (tek dosya, tek süreç, in-mem log): Follower/Candidate/Leader, RequestVote & AppendEntries, seçim/heartbeat zamanlayıcıları, çoğunlukla commit kuralı, apply kanalı.

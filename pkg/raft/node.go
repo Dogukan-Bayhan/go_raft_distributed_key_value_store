@@ -44,7 +44,7 @@ type AppendEntries struct {
 	LeaderID int 
 	LastLogTerm uint64 
 	LastLogIndex uint64
-	Entries [][]byte
+	Entries []LogEntry
 	LeaderCommit uint64 // Leaders commit index
 }
 
@@ -79,6 +79,11 @@ type Node struct {
 	Peers []int
 	Role Role
 
+	Log         []LogEntry
+	LastApplied uint64
+
+	NextIndex   map[int]uint64 // only leader
+	MatchIndex  map[int]uint64
 
 	CommitIndex uint64
 
@@ -106,6 +111,10 @@ func NewNode(id int, peers []int, r*LocalRouter) *Node{
 		ElectionTimer: time.NewTimer(jitterElection()),
 		HeartbeatTicker: nil,
 		Router: r,
+		Log: []LogEntry{{Term: 0, Index: 0, Type: EntryBarrier}},
+		LastApplied: 0,
+		LastIndex: 0,
+		LastTerm: 0,
 	}
 
 	return n
@@ -155,6 +164,7 @@ func (n *Node) startElection() {
 		n.resetElection()
 		return
 	}
+
 	term := atomic.AddUint64(&n.CurrentTerm, 1)
 	n.Role = Candidate
 	n.VotedFor = n.Id
@@ -164,10 +174,12 @@ func (n *Node) startElection() {
 
 	log.Printf("[n%d] start a new election for term=%d", n.Id, term)
 
+	currentTerm, currentIndex := n.LastLogTerm(), n.LastLogIndex()
+
 	req := VoteRequest{
 		Term: term,
-		LastTerm: n.CurrentTerm,
-		LastIndex: n.LastIndex,
+		LastTerm: currentTerm,
+		LastIndex: currentIndex,
 		CandidateId: n.Id,
 	}
 
@@ -191,6 +203,15 @@ func (n * Node) becomeLeader() {
             select { case <-n.ElectionTimer.C: default: }
         }
     }
+
+	n.NextIndex = make(map[int]uint64, len(n.Peers))
+	n.MatchIndex = make(map[int]uint64, len(n.Peers))
+	li := n.LastLogIndex()
+	for _, p := range n.Peers {
+		n.NextIndex[p]  = li + 1
+		n.MatchIndex[p] = 0
+	}
+	n.MatchIndex[n.Id] = li
 
 	// I chose a 80 miliseconds for heartbeat messages because its enough
 	// for my project but this depends on heartbeat round-trip time and also
@@ -233,6 +254,8 @@ func (n *Node) handleRPC(m RpcMessage) {
 		n.handleRequestVote(m.From, msg)
 	case VoteResponse:
 		n.handleVoteResponse(m.From, msg)
+	case AppendEntriesResponse:
+		n.handleAppendEntriesResponse(m.From, msg)
 	default:
 		// ignore
 	}
@@ -270,7 +293,7 @@ func (n *Node) handleAppendEntries(from int, req AppendEntries) {
 	term := atomic.LoadUint64(&n.CurrentTerm)
 	if req.Term < term {
 		
-		n.sendRPC(RpcMessage{From: n.Id, To: from, Body: AppendEntriesResponse{Term: term, Success: false}})
+		n.sendRPC(RpcMessage{From: n.Id, To: from, Body: AppendEntriesResponse{Term: term, Success: false, LastIndex: n.LastLogIndex()}})
 		return
 	}
 	
@@ -281,16 +304,135 @@ func (n *Node) handleAppendEntries(from int, req AppendEntries) {
 	}
 	n.resetElection()
 
-	// In here we normally sync the log with given body
-	// logSync()
+	if req.LastLogIndex > n.LastLogIndex() {
+		n.sendRPC(RpcMessage{From: n.Id, To: from, Body: AppendEntriesResponse{
+			Term: n.CurrentTerm, Success: false, LastIndex: n.LastLogIndex(),
+		}})
+		return
+	}
 
-	// Send a success rpc to leader
+	if req.LastLogIndex > 0 {
+		t, ok := n.TermAt(req.LastLogIndex)
+		if !ok || t != req.LastLogTerm {
+			n.Log = n.Log[:req.LastLogIndex+1]
+			n.LastIndex, n.LastTerm = n.LastLogIndex(), n.LastLogTerm()
+			n.sendRPC(RpcMessage{From: n.Id, To: from, Body: AppendEntriesResponse{
+				Term: n.CurrentTerm, Success: false, LastIndex: n.LastLogIndex(),
+			}})
+			return
+		}
+	}
+
+	if len(req.Entries) > 0 {
+		insertAt := req.LastLogIndex + 1
+		if insertAt <= n.LastLogIndex() {
+			n.Log = n.Log[:insertAt] 
+		}
+		n.Log = append(n.Log, req.Entries...)
+		n.LastIndex, n.LastTerm = n.LastLogIndex(), n.LastLogTerm()
+	}
+
+	if req.LeaderCommit > n.CommitIndex {
+		hi := n.LastLogIndex()
+		if req.LeaderCommit < hi {
+			hi = req.LeaderCommit
+		}
+		for idx := n.CommitIndex + 1; idx <= hi; idx++ {
+			e := n.Log[idx]
+			if e.Type == EntryNormal && n.ApplyChan != nil {
+				n.ApplyChan <- e.Data
+			}
+			n.LastApplied = idx
+		}
+		n.CommitIndex = hi
+	}
+
+
 	n.sendRPC(RpcMessage{From: n.Id, To: from, Body: AppendEntriesResponse{
 		Term:      atomic.LoadUint64(&n.CurrentTerm),
 		Success:   true,
 		LastIndex: 0,
 	}})
 }
+
+
+
+func (n *Node) handleAppendEntriesResponse(from int, resp AppendEntriesResponse) {
+	if n.Role != Leader {
+		return
+	}
+
+	myTerm := atomic.LoadUint64(&n.CurrentTerm)
+	if resp.Term > myTerm {
+		n.becomeFollower(resp.Term, -1)
+		return
+	}
+
+	if !resp.Success {
+		if n.NextIndex[from] > 1 {
+			n.NextIndex[from]--
+		}
+		prevIdx := n.NextIndex[from] - 1
+		prevTerm, _ := n.TermAt(prevIdx)
+		req := AppendEntries{
+			Term:         n.CurrentTerm,
+			LeaderID:     n.Id,
+			LastLogIndex: prevIdx,
+			LastLogTerm:  prevTerm,
+			Entries:      nil,
+			LeaderCommit: n.CommitIndex,
+		}
+		n.sendRPC(RpcMessage{From: n.Id, To: from, Body: req})
+		return
+	}
+
+	
+	if resp.LastIndex > n.MatchIndex[from] {
+		n.MatchIndex[from] = resp.LastIndex
+	}
+	n.NextIndex[from] = n.MatchIndex[from] + 1
+
+	n.maybeAdvanceCommit()
+}
+
+func (n *Node) maybeAdvanceCommit() {
+	if n.Role != Leader {
+		return
+	}
+	oldCommit := n.CommitIndex
+	last := n.LastLogIndex()
+	for N := oldCommit + 1; N <= last; N++ {
+		if n.Log[N].Term != n.CurrentTerm {
+			continue
+		}
+		count := 1 
+		for _, p := range n.Peers {
+			if p == n.Id {
+				continue
+			}
+			if n.MatchIndex[p] >= N {
+				count++
+			}
+		}
+		if count >= (len(n.Peers)/2)+1 {
+			n.CommitIndex = N
+		}
+	}
+	if n.CommitIndex != oldCommit {
+		n.applyCommitted()
+	}
+}
+
+func (n *Node) applyCommitted() {
+	for n.LastApplied < n.CommitIndex {
+		n.LastApplied++
+		e := n.Log[n.LastApplied]
+		if e.Type == EntryNormal && n.ApplyChan != nil {
+			n.ApplyChan <- e.Data
+		}
+	}
+}
+
 
 
 
@@ -304,8 +446,12 @@ func (n *Node) handleRequestVote(from int, req VoteRequest) {
 	if req.Term > term {
 		n.becomeFollower(req.Term, -1)
 	}
+
+	myLastIdx, myLastTerm := n.LastLogIndex(), n.LastLogTerm()
+	upToDate := (req.LastTerm > myLastTerm) || (req.LastTerm == myLastTerm && req.LastIndex >= myLastIdx)
+
 	grant := false
-	if (n.VotedFor == -1 || n.VotedFor == req.CandidateId) && n.Role != Leader {
+	if upToDate && (n.VotedFor == -1 || n.VotedFor == req.CandidateId) && n.Role != Leader {
 		grant = true
 		n.VotedFor = req.CandidateId
 		n.resetElection()
@@ -319,11 +465,23 @@ func (n *Node) handleRequestVote(from int, req VoteRequest) {
 
 func (n *Node) broadcastHeartbeats() {
 	term := atomic.LoadUint64(&n.CurrentTerm)
-	req := AppendEntries{Term: term, LeaderID: n.Id}
 	for _, p := range n.Peers {
 		if p == n.Id {
 			continue
 		}
+
+		prevIdx := n.NextIndex[p] - 1
+		prevTerm, _ := n.TermAt(prevIdx)
+
+		req := AppendEntries{
+			Term:         term,
+			LeaderID:     n.Id,
+			LastLogIndex: prevIdx,
+			LastLogTerm:  prevTerm,
+			Entries:      nil,              
+			LeaderCommit: n.CommitIndex,
+		}
+
 		n.sendRPC(RpcMessage{From: n.Id, To: p, Body: req})
 	}
 }
@@ -332,8 +490,33 @@ func (n *Node) sendRPC(m RpcMessage) {
 	if n.Router != nil {
 		n.Router.Send(m)
 	}
+}
 
-	// İlk aşama: aynı proses içinde kanal ile (test kolaylığı)
-	// Gerçek ağ sürümünde: net.Dial -> gob/json ile m.Body encode et.
-	// Bu iskelette boş bırakıyoruz; test harness dolduracak.
+
+func (n *Node) AppendLocal(e LogEntry) {
+	n.Log = append(n.Log, e)
+	n.LastIndex = e.Index
+	n.LastTerm  = e.Term
+}
+
+func (n *Node) ReplicateTo(peer int) {
+	if n.Role != Leader {
+		return
+	}
+	next := n.NextIndex[peer]
+	prevIdx := next - 1
+	prevTerm, _ := n.TermAt(prevIdx)
+
+	entries := make([]LogEntry, n.LastLogIndex()-next+1)
+	copy(entries, n.Log[next:])
+
+	req := AppendEntries{
+		Term:         n.CurrentTerm,
+		LeaderID:     n.Id,
+		LastLogIndex: prevIdx,
+		LastLogTerm:  prevTerm,
+		Entries:      entries,
+		LeaderCommit: n.CommitIndex,
+	}
+	n.sendRPC(RpcMessage{From: n.Id, To: peer, Body: req})
 }

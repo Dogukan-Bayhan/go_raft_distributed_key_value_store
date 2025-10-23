@@ -329,5 +329,12 @@ func (w *WAL) Close() error {
 	if err := w.sfile.Sync(); err != nil {
 		return err
 	}
-	if err
+	if err := w.sfile.Close(); err != nil {
+		return err
+	}
+	w.closed = true
+	if w.corrupt {
+		return ErrCorrupt
+	}
+	return nil
 }

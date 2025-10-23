@@ -148,10 +148,12 @@ type batchEntry struct {
 
 
 func Open(path string, opts *Options) (*WAL, error){
-	
+	// If user don't give any option function use
+	// default options as opts
 	if opts == nil {
 		opts = DefaultOptions
 	}
+
 	if opts.SegmentCacheSize <= 0 {
 		opts.SegmentCacheSize = DefaultOptions.SegmentCacheSize
 	}
@@ -294,6 +296,38 @@ func Open(path string, opts *Options) (*WAL, error){
 	return w, nil
 }
 
+func abs(path string) (string, error) {
+	if path == ":memory:" {
+		return "", errors.New("in-memory log not supported")
+	}
+	return filepath.Abs(path)
+}
+
+func (w *WAL) pushCache(segIdx int) {
+	_, _, _, v, evicted :=
+		w.scache.SetEvicted(segIdx, w.segments[segIdx])
+	if evicted {
+		s := v.(*segment)
+		s.ebuf = nil
+		s.epos = nil
+	}
+}
+
 func segmentName(index uint64) string {
 	return fmt.Sprintf("%020d", index)
+}
+
+func (w *WAL) Close() error {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if w.closed {
+		if w.corrupt {
+			return ErrCorrupt
+		}
+		return ErrClosed
+	}
+	if err := w.sfile.Sync(); err != nil {
+		return err
+	}
+	if err
 }

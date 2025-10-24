@@ -552,3 +552,4 @@ func (n *Node) ReplicateTo(peer int) {
 	}
 	n.sendRPC(RpcMessage{From: n.Id, To: peer, Body: req})
 }
+

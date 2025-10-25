@@ -2,6 +2,7 @@ package storage
 
 import (
 	"encoding/base64"
+	"encoding/binary"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -490,4 +491,93 @@ func appendJSONData(dst []byte, s []byte) []byte {
 	dst = append(dst, '"', '$')
 	dst = append(dst, base64.URLEncoding.EncodeToString(s)...)
 	return append(dst, '"')
+}
+
+
+// appendBinaryEntry appends a new WAL entry in compact binary format.
+//
+// Layout in file:
+//   [Uvarint(length)] [data...]
+//
+// Example:
+//   data = []byte("PUT x=10")
+//   encoded = [0x08] [50 55 54 32 78 61 49 48]
+//
+// Returns:
+//   - out: updated buffer containing the new entry
+//   - epos: byte position range of the entry within the buffer (start and end)
+//
+// Note:
+//   - Each entry is prefixed with its length encoded via Uvarint.
+//   - This allows for efficient sequential reads without separators.
+func appendBinaryEntry(dst []byte, data []byte) (out []byte, epos bpos) {
+	pos := len(dst)
+	dst = appendUvarint(dst, uint64(len(data)))
+	dst = append(dst, data...)
+	return dst, bpos{pos, len(dst)}
+}
+
+
+// appendUvarint appends an unsigned integer (uint64) encoded in Uvarint form.
+//
+// Uvarint encoding uses 1–10 bytes depending on the value, making small numbers
+// take up less space. This is ideal for log formats where most entries are small.
+//
+// Example:
+//   127  → [0x7F]      (1 byte)
+//   128  → [0x80,0x01] (2 bytes)
+func appendUvarint(dst []byte, x uint64) []byte {
+	var buf[10]byte
+	n := binary.PutUvarint(buf[:], x)
+	dst = append(dst, buf[:n]...)
+	return dst
+}
+
+func (b *Batch) Write(index uint64, data []byte) {
+	b.entries = append(b.entries, batchEntry{index, len(data)})
+	b.datas = append(b.datas, data...)
+}
+
+func (b *Batch) Clear() {
+	b.entries = b.entries[:0]
+	b.datas = b.datas[:0]
+}
+
+
+func (w *WAL) WriteBacth(b *Batch) error {
+	w.mu.Unlock()
+	defer w.mu.Unlock()
+	if w.corrupt {
+		return ErrCorrupt
+	} else if w.closed {
+		return ErrClosed
+	}
+	if len(b.entries) == 0 {
+		return nil
+	}
+	return w.writeBatch(b)
+}
+
+func (w *WAL) writeBatch(b *Batch) error {
+	for i := 0; i < len(b.entries); i++ {
+		if b.entries[i].index != w.lastIndex + uint64(i + 1) {
+			return ErrOutOfOrder
+		}
+	}
+
+	s := w.segments[len(w.segments)-1]
+	if len(s.ebuf) > w.opts.SegmentSize {
+		if err := w.cycle(); err != nil {
+			return err
+		}
+		s = w.segments[len(w.segments)-1]
+	}
+
+	mark := len(s.ebuf)
+	datas := b.datas
+	for i := 0; i < len(b.entries); i++ {
+		
+	}
+
+	return nil
 }

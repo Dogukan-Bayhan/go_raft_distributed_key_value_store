@@ -1,6 +1,7 @@
 package storage
 
 import (
+	"bytes"
 	"encoding/base64"
 	"encoding/binary"
 	"encoding/json"
@@ -14,6 +15,7 @@ import (
 	"unicode/utf8"
 	"unsafe"
 
+	"github.com/tidwall/gjson"
 	"github.com/tidwall/tinylru"
 )
 
@@ -679,5 +681,32 @@ func (w *WAL) findSegment(index uint64) int {
 		}
 	}
 	return i - 1                 
+}
+
+
+func loadNextJSONEntry(data []byte) (n int, err error) {
+	// {"index":number,"data":string}
+	idx := bytes.IndexByte(data, '\n')
+	if idx == -1 {
+		return 0, ErrCorrupt
+	}
+	line := data[:idx]
+	dres := gjson.Get(*(*string)(unsafe.Pointer(&line)), "data")
+	if dres.Type != gjson.String {
+		return 0, ErrCorrupt
+	}
+	return idx + 1, nil
+}
+
+func loadNextBinaryEntry(data []byte) (n int, err error) {
+	// data_size + data
+	size, n := binary.Uvarint(data)
+	if n <= 0 {
+		return 0, ErrCorrupt
+	}
+	if uint64(len(data)-n) < size {
+		return 0, ErrCorrupt
+	}
+	return n + int(size), nil
 }
 

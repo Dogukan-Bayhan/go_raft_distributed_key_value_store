@@ -402,7 +402,7 @@ func (w *WAL) Write(index uint64, data []byte) error {
 // Depending on the configured log format (binary or JSON), this method delegates
 // to the appropriate encoder (appendBinaryEntry or appendJSONEntry) and returns
 // both the updated buffer and the entry’s byte position (bpos).
-func (w *WAL) addpendEntry(dst []byte, index uint64, data []byte) (out []byte, epos bpos) {
+func (w *WAL) appendEntry(dst []byte, index uint64, data []byte) (out []byte, epos bpos) {
 	if w.opts.LogFormat == JSON {
 		return appendJSONEntry(dst, index, data)
 	}
@@ -576,8 +576,108 @@ func (w *WAL) writeBatch(b *Batch) error {
 	mark := len(s.ebuf)
 	datas := b.datas
 	for i := 0; i < len(b.entries); i++ {
-		
-	}
+		data := datas[:b.entries[i].size]
+		var epos bpos
+		s.ebuf, epos = w.appendEntry(s.ebuf, b.entries[i].index, data)
+		s.epos = append(s.epos, epos)
+		if len(s.ebuf) >= w.opts.SegmentSize {
 
+			if _, err := w.sfile.Write(s.ebuf[mark:]); err != nil {
+				return err
+			}
+			w.lastIndex = b.entries[i].index
+			if err := w.cycle(); err != nil {
+				return err
+			}
+			s = w.segments[len(w.segments)-1]
+			mark = 0
+		}
+		datas = datas[b.entries[i].size:]
+	}
+	if len(s.ebuf)-mark > 0 {
+		if _, err := w.sfile.Write(s.ebuf[mark:]); err != nil {
+			return err
+		}
+		w.lastIndex = b.entries[len(b.entries)-1].index
+	}
+	if w.opts.NoSync {
+		if err := w.sfile.Sync(); err != nil {
+			return err
+		}
+	}
+	b.Clear()
 	return nil
 }
+
+
+// FirstIndex returns the index of the first entry in the WAL.
+// It provides a concurrency-safe way to retrieve the starting index of the log.
+// If the WAL is closed or marked corrupt, an appropriate error is returned.
+// If AllowEmpty is disabled and the log contains no entries, it returns 0 with no error.
+func (w *WAL) FirstIndex() (index uint64, err error) {
+	w.mu.RLock()                 
+	defer w.mu.RUnlock()         
+
+	if w.corrupt {               
+		return 0, ErrCorrupt     
+	} else if w.closed {         
+		return 0, ErrClosed
+	}
+
+	// If the log is empty and empty logs are not allowed,
+	// return zero without treating it as an error.
+	if !w.opts.AllowEmpty && w.lastIndex == 0 {
+		return 0, nil
+	}
+
+	// Return the first valid index in the WAL.
+	return w.firstIndex, nil
+}
+
+
+
+// LastIndex returns the index of the last entry written to the WAL.
+// It is used to determine the current end of the log for appending new entries.
+// Returns error if the WAL is closed or marked as corrupt.
+// If AllowEmpty is disabled and the log has no entries, it safely returns 0.
+func (w *WAL) LastIndex() (index uint64, err error) {
+	w.mu.RLock()                 
+	defer w.mu.RUnlock()
+
+	if w.corrupt {               
+		return 0, ErrCorrupt
+	} else if w.closed {        
+		return 0, ErrClosed
+	}
+
+	// Empty WAL handling (mirrors FirstIndex logic)
+	if !w.opts.AllowEmpty && w.firstIndex == 0 {
+		return 0, nil
+	}
+
+	// Return the latest valid index written to WAL.
+	return w.lastIndex, nil
+}
+
+
+// findSegment performs a binary search to locate which segment file
+// contains the specified log index. It returns the index position of
+// that segment within the w.segments slice.
+// 
+// The search relies on the invariant that w.segments is sorted in ascending
+// order by the starting index of each segment. If the requested index is
+// smaller than the first segment’s index or greater than all known segments,
+// the returned position will indicate the segment closest to the range.
+func (w *WAL) findSegment(index uint64) int {
+	i, j := 0, len(w.segments)   
+	for i < j {
+		h := i + (j-i)/2          
+		if index >= w.segments[h].index {
+			i = h + 1            
+		} else {
+			j = h                 
+		}
+	}
+	return i - 1                 
+}
+

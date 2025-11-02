@@ -9,15 +9,19 @@ import(
 )
 
 func TestSingleElection(t *testing.T) {
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
+    ctx, cancel := context.WithCancel(context.Background())
+    defer cancel()
 
-	router := raft.NewLocalRouter()
+    router := raft.NewLocalRouter()
 
-	nodes := []*raft.Node{
-        raft.NewNode(1, []int{1, 2, 3}, router),
-        raft.NewNode(2, []int{1, 2, 3}, router),
-        raft.NewNode(3, []int{1, 2, 3}, router),
+    ids := []int{1, 2, 3}
+    nodes := make([]*raft.Node, 0, len(ids))
+    for _, id := range ids {
+        n, err := raft.NewNode(id, ids, router)
+        if err != nil {
+            t.Fatalf("failed to create node %d: %v", id, err)
+        }
+        nodes = append(nodes, n)
     }
 
     for _, n := range nodes {
@@ -28,7 +32,7 @@ func TestSingleElection(t *testing.T) {
         go n.Run(ctx)
     }
 
-	time.Sleep(2 * time.Second)
+    time.Sleep(2 * time.Second)
 
     leaderCount := 0
     for _, n := range nodes {

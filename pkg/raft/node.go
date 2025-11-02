@@ -2,6 +2,7 @@ package raft
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"log"
 	"math/rand"
@@ -114,12 +115,20 @@ type Node struct {
 	wal *storage.WAL
 }
 
-func NewNode(id int, peers []int, r *LocalRouter) *Node {
+func NewNode(id int, peers []int, r *LocalRouter) (*Node, error) {
 	basePath, _ := filepath.Abs(filepath.Join("pkg", "storage", "wal"))
-	os.MkdirAll(basePath, 0755)
+	err := os.MkdirAll(basePath, 0755)
+
+	if err != nil {
+		return nil, err
+	}
 
 	path := filepath.Join(basePath, fmt.Sprintf("node-%d", id))
-	os.MkdirAll(path, 0755)
+	err = os.MkdirAll(path, 0755)
+
+	if err != nil {
+		return nil, err
+	}
 
 	opts := storage.Options{
 		SegmentSize: 20 * 1024 * 1024,
@@ -130,7 +139,24 @@ func NewNode(id int, peers []int, r *LocalRouter) *Node {
 
 	wal, err := storage.Open(path, &opts)
 	if err != nil {
-		log.Fatalf("[n%d] failed to open WAL: %v", id, err)
+    	return nil, fmt.Errorf("[n%d] failed to open WAL: %w", id, err)
+	}
+
+	walLastIndex, err := wal.LastIndex()
+
+	if err != nil {
+		return nil, err
+	}
+
+	var lastTerm uint64
+	if walLastIndex > 0 {
+		data, err := wal.Read(walLastIndex)
+		if err == nil {
+			var e LogEntry
+			if jsonErr := json.Unmarshal(data, &e); jsonErr == nil {
+				lastTerm = e.Term
+			}
+		}
 	}
 
 	rand.Seed(time.Now().UnixNano())
@@ -147,13 +173,13 @@ func NewNode(id int, peers []int, r *LocalRouter) *Node {
 		Router:          r,
 		Log:             []LogEntry{{Term: 0, Index: 0, Type: EntryBarrier}},
 		LastApplied:     0,
-		LastIndex:       0,
-		LastTerm:        0,
+		LastIndex:       walLastIndex,
+		LastTerm:        lastTerm,
 		Pending:         make(map[uint64]chan []byte),
 		wal:             wal,
 	}
 
-	return n
+	return n, nil
 }
 
 // jitterElection returns a randomized election timeout between 300ms and 600ms.

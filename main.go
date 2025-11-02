@@ -18,7 +18,10 @@ func main() {
 
 	// Create 3 nodes
 	for _, id := range peerIDs {
-		n := raft.NewNode(id, peerIDs, router)
+		n, err:= raft.NewNode(id, peerIDs, router)
+		if err != nil {
+			log.Fatalln(err)
+		}
 		router.Register(n)
 		nodes = append(nodes, n)
 		ctx := context.Background()

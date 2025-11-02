@@ -13,10 +13,16 @@ func TestHeartbeatPreventsElection(t *testing.T) {
 	defer cancel()
 
 	router := raft.NewLocalRouter()
-	nodes := []*raft.Node{
-		raft.NewNode(1, []int{1, 2}, router),
-		raft.NewNode(2, []int{1, 2}, router),
+	nodes := []*raft.Node{}
+	n1, err := raft.NewNode(1, []int{1, 2}, router)
+	if err != nil {
+		t.Fatalf("failed to create node 1: %v", err)
 	}
+	n2, err := raft.NewNode(2, []int{1, 2}, router)
+	if err != nil {
+		t.Fatalf("failed to create node 2: %v", err)
+	}
+	nodes = append(nodes, n1, n2)
 
 	for _, n := range nodes {
 		router.Register(n)

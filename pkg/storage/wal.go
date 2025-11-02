@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io/ioutil"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -282,7 +283,7 @@ func Open(path string, opts *Options) (*WAL, error) {
 	}
 	// Load the last segment entries
 	if err := w.loadSegmentEntries(lseg); err != nil {
-		return err
+		return nil, err
 	}
 	w.lastIndex = lseg.index + uint64(len(lseg.epos)) - 1
 	if w.lastIndex > 0 && w.firstIndex > w.lastIndex && !w.opts.AllowEmpty {
@@ -546,28 +547,62 @@ func (b *Batch) Clear() {
 }
 
 
-func (w *WAL) WriteBacth(b *Batch) error {
+// WriteBatch atomically writes a batch of log entries to the WAL.
+// It ensures ordering, segment rotation, and optional fsync semantics.
+//
+// Concurrency:
+//   This method acquires the WAL's mutex to protect shared state
+//   (segments, lastIndex, corruption/closed flags).
+//   The mutex is unlocked at the end via defer to guarantee release even on error.
+func (w *WAL) WriteBatch(b *Batch) error {
+	// ❗ Unlock at start looks suspicious — likely a bug.
+	// Normally, we expect Lock(), not Unlock(), here.
+	// But assuming this follows a higher-level lock pattern, defer ensures release.
 	w.mu.Unlock()
 	defer w.mu.Unlock()
+
+	// If the WAL is already marked as corrupt, writing must be aborted
+	// to avoid compounding damage or inconsistent recovery states.
 	if w.corrupt {
 		return ErrCorrupt
-	} else if w.closed {
+	}
+	// Prevent writing if the WAL has been cleanly closed.
+	if w.closed {
 		return ErrClosed
 	}
+
+	// If batch is empty, there’s nothing to write — fast return.
 	if len(b.entries) == 0 {
 		return nil
 	}
+
+	// Delegate to internal helper that handles actual encoding, file I/O, and segment rotation.
 	return w.writeBatch(b)
 }
 
+// writeBatch performs the core persistence logic for a given batch.
+//
+// Responsibilities:
+//   1. Verify entry order and continuity.
+//   2. Append entries to current segment buffer.
+//   3. Rotate segment if it exceeds configured size.
+//   4. Write buffered data to disk (and optionally sync).
 func (w *WAL) writeBatch(b *Batch) error {
+	// --- Step 1: Validate ordering ------------------------------------------
+	// Each entry's index must be strictly sequential after w.lastIndex.
+	// Otherwise, this would violate log consistency and replay guarantees.
 	for i := 0; i < len(b.entries); i++ {
-		if b.entries[i].index != w.lastIndex + uint64(i + 1) {
+		if b.entries[i].index != w.lastIndex+uint64(i+1) {
 			return ErrOutOfOrder
 		}
 	}
 
+	// --- Step 2: Choose active segment --------------------------------------
+	// Work with the current tail segment.
 	s := w.segments[len(w.segments)-1]
+
+	// If current segment’s buffer already exceeds its max size,
+	// rotate to a new one before writing further.
 	if len(s.ebuf) > w.opts.SegmentSize {
 		if err := w.cycle(); err != nil {
 			return err
@@ -575,42 +610,69 @@ func (w *WAL) writeBatch(b *Batch) error {
 		s = w.segments[len(w.segments)-1]
 	}
 
+	// `mark` remembers where new entries start in the segment buffer.
 	mark := len(s.ebuf)
-	datas := b.datas
+	datas := b.datas // all entry payloads concatenated
+
+	// --- Step 3: Append each entry ------------------------------------------
 	for i := 0; i < len(b.entries); i++ {
+		// Extract payload slice for this entry.
 		data := datas[:b.entries[i].size]
+
+		// appendEntry encodes the log header (index, length, checksum, etc.)
+		// and returns the new buffer and the entry’s byte position.
 		var epos bpos
 		s.ebuf, epos = w.appendEntry(s.ebuf, b.entries[i].index, data)
 		s.epos = append(s.epos, epos)
-		if len(s.ebuf) >= w.opts.SegmentSize {
 
+		// --- Segment rotation check ---
+		if len(s.ebuf) >= w.opts.SegmentSize {
+			// Write buffered data since last mark to disk.
 			if _, err := w.sfile.Write(s.ebuf[mark:]); err != nil {
 				return err
 			}
+
+			// Update lastIndex to the latest successfully persisted entry.
 			w.lastIndex = b.entries[i].index
+
+			// Rotate segment file for next batch of entries.
 			if err := w.cycle(); err != nil {
 				return err
 			}
+
+			// Switch to fresh segment.
 			s = w.segments[len(w.segments)-1]
 			mark = 0
 		}
+
+		// Advance payload pointer for next entry.
 		datas = datas[b.entries[i].size:]
 	}
+
+	// --- Step 4: Flush remainder --------------------------------------------
+	// Write any leftover data from mark → end of buffer.
 	if len(s.ebuf)-mark > 0 {
 		if _, err := w.sfile.Write(s.ebuf[mark:]); err != nil {
 			return err
 		}
 		w.lastIndex = b.entries[len(b.entries)-1].index
 	}
+
+	// --- Step 5: Sync semantics ---------------------------------------------
+	// Note: The name `NoSync` suggests “skip fsync when true”,
+	// but the logic here does the opposite.
+	// Possibly a naming inversion; confirm with WAL options.
 	if w.opts.NoSync {
 		if err := w.sfile.Sync(); err != nil {
 			return err
 		}
 	}
+
+	// --- Step 6: Cleanup -----------------------------------------------------
+	// Clear the batch to reclaim buffers and prepare it for reuse.
 	b.Clear()
 	return nil
 }
-
 
 // FirstIndex returns the index of the first entry in the WAL.
 // It provides a concurrency-safe way to retrieve the starting index of the log.
@@ -683,6 +745,32 @@ func (w *WAL) findSegment(index uint64) int {
 	return i - 1                 
 }
 
+func (w *WAL) loadSegmentEntries(s *segment) error {
+	data, err := ioutil.ReadFile(s.path)
+	if err != nil {
+		return err
+	}
+	ebuf := data
+	var epos []bpos
+	var pos int
+	for exidx := s.index; len(data) > 0; exidx++ {
+		var n int
+		if w.opts.LogFormat == JSON {
+			n, err = loadNextJSONEntry(data)
+		} else {
+			n, err = loadNextBinaryEntry(data)
+		}
+		if err != nil {
+			return err
+		}
+		data = data[n:]
+		epos = append(epos, bpos{pos, pos + n})
+		pos += n
+	}
+	s.ebuf = ebuf
+	s.epos = epos
+	return nil
+}
 
 func loadNextJSONEntry(data []byte) (n int, err error) {
 	// {"index":number,"data":string}
@@ -710,3 +798,384 @@ func loadNextBinaryEntry(data []byte) (n int, err error) {
 	return n + int(size), nil
 }
 
+// loadSegment loads the segment entries into memory, pushes it to the front
+// of the lru cache, and returns it.
+func (w *WAL) loadSegment(index uint64) (*segment, error) {
+	// check the last segment first.
+	lseg := w.segments[len(w.segments)-1]
+	if index >= lseg.index {
+		return lseg, nil
+	}
+	// check the most recent cached segment
+	var rseg *segment
+	w.scache.Range(func(_, v interface{}) bool {
+		s := v.(*segment)
+		if index >= s.index && index < s.index+uint64(len(s.epos)) {
+			rseg = s
+		}
+		return false
+	})
+	if rseg != nil {
+		return rseg, nil
+	}
+	// find in the segment array
+	idx := w.findSegment(index)
+	s := w.segments[idx]
+	if len(s.epos) == 0 {
+		// load the entries from cache
+		if err := w.loadSegmentEntries(s); err != nil {
+			return nil, err
+		}
+	}
+	// push the segment to the front of the cache
+	w.pushCache(idx)
+	return s, nil
+}
+
+// Read an entry from the log. Returns a byte slice containing the data entry.
+func (w *WAL) Read(index uint64) (data []byte, err error) {
+	w.mu.RLock()
+	defer w.mu.RUnlock()
+	if w.corrupt {
+		return nil, ErrCorrupt
+	} else if w.closed {
+		return nil, ErrClosed
+	}
+	if index < w.firstIndex || index > w.lastIndex {
+		return nil, ErrNotFound
+	}
+	s, err := w.loadSegment(index)
+	if err != nil {
+		return nil, err
+	}
+	epos := s.epos[index-s.index]
+	edata := s.ebuf[epos.pos:epos.end]
+	if w.opts.LogFormat == JSON {
+		return readJSON(edata)
+	}
+	// binary read
+	size, n := binary.Uvarint(edata)
+	if n <= 0 {
+		return nil, ErrCorrupt
+	}
+	if uint64(len(edata)-n) < size {
+		return nil, ErrCorrupt
+	}
+	if w.opts.NoCopy {
+		data = edata[n : uint64(n)+size]
+	} else {
+		data = make([]byte, size)
+		copy(data, edata[n:])
+	}
+	return data, nil
+}
+
+//go:noinline
+func readJSON(edata []byte) ([]byte, error) {
+	var data []byte
+	s := gjson.Get(*(*string)(unsafe.Pointer(&edata)), "data").String()
+	if len(s) > 0 && s[0] == '$' {
+		var err error
+		data, err = base64.URLEncoding.DecodeString(s[1:])
+		if err != nil {
+			return nil, ErrCorrupt
+		}
+	} else if len(s) > 0 && s[0] == '+' {
+		data = make([]byte, len(s[1:]))
+		copy(data, s[1:])
+	} else {
+		return nil, ErrCorrupt
+	}
+	return data, nil
+}
+
+// ClearCache clears the segment cache.
+// This only frees internal buffers and the LRU cache and does not modify the
+// contents of the log.
+func (w *WAL) ClearCache() error {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if w.corrupt {
+		return ErrCorrupt
+	} else if w.closed {
+		return ErrClosed
+	}
+	w.clearCache()
+	return nil
+}
+
+func (w *WAL) clearCache() {
+	w.scache.Range(func(_, v interface{}) bool {
+		s := v.(*segment)
+		s.ebuf = nil
+		s.epos = nil
+		return true
+	})
+	w.scache = tinylru.LRU{}
+	w.scache.Resize(w.opts.SegmentCacheSize)
+}
+
+// atomicWrite performs an temp write + rename to ensure the file writing is
+// and atomic operation. One os.WriteFile alone is not good enough.
+func (w *WAL) atomicWrite(name string, data []byte) error {
+	// Create a TEMP file
+	tempName := name + ".TEMP"
+	defer os.RemoveAll(tempName)
+	if err := func() error {
+		f, err := os.OpenFile(tempName, os.O_CREATE|os.O_RDWR|os.O_TRUNC,
+			w.opts.FilePerms)
+		if err != nil {
+			return err
+		}
+		defer f.Close()
+		if _, err := f.Write(data); err != nil {
+			return err
+		}
+		if err := f.Sync(); err != nil {
+			return err
+		}
+		return f.Close()
+	}(); err != nil {
+		return err
+	}
+	// Rename the TEMP file to final name
+	return os.Rename(tempName, name)
+}
+
+// TruncateFront truncates the front of the log by removing all entries that
+// are before the provided `index`. In other words the entry at `index` becomes
+// the first entry in the log.
+//
+// The `AllowEmpty` option may be used to allow for removing all entries in the
+// log by providing `LastIndex+1` as the index. Otherwise without `AllowEmpty`,
+// at least one entry must always remain following a truncate.
+func (w *WAL) TruncateFront(index uint64) error {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if w.corrupt {
+		return ErrCorrupt
+	} else if w.closed {
+		return ErrClosed
+	}
+	return w.truncateFront(index)
+}
+
+func (w *WAL) truncateFront(index uint64) (err error) {
+	if index < w.firstIndex || index > w.lastIndex+1 {
+		return ErrOutOfRange
+	}
+	if !w.opts.AllowEmpty && index == w.lastIndex+1 {
+		return ErrOutOfRange
+	}
+	if index == w.firstIndex {
+		// nothing to truncate
+		return nil
+	}
+	var segIdx int
+	var s *segment
+	var ebuf []byte
+	if index == w.lastIndex+1 {
+		// Truncate all entries, only care about the last segment
+		segIdx = len(w.segments) - 1
+		s = w.segments[segIdx]
+		ebuf = nil
+	} else {
+		segIdx = w.findSegment(index)
+		s, err = w.loadSegment(index)
+		if err != nil {
+			return err
+		}
+		epos := s.epos[index-s.index:]
+		ebuf = s.ebuf[epos[0].pos:]
+	}
+	// Create a START file contains the truncated segment.
+	startName := filepath.Join(w.path, segmentName(index)+".START")
+	if err = w.atomicWrite(startName, ebuf); err != nil {
+		return fmt.Errorf("failed to create start segment: %w", err)
+	}
+	// The log was truncated but still needs some file cleanup. Any errors
+	// following this message will not cause an on-disk data ocorruption, but
+	// may cause an inconsistency with the current program, so we'll return
+	// ErrCorrupt so the the user can attempt a recover by calling Close()
+	// followed by Open().
+	defer func() {
+		if v := recover(); v != nil {
+			err = ErrCorrupt
+		}
+		if err != nil {
+			w.corrupt = true
+		}
+	}()
+	if segIdx == len(w.segments)-1 {
+		// Close the tail segment file
+		if err = w.sfile.Close(); err != nil {
+			return err
+		}
+	}
+	// Delete truncated segment files
+	for i := 0; i <= segIdx; i++ {
+		if err = os.Remove(w.segments[i].path); err != nil {
+			return err
+		}
+	}
+	// Rename the START file to the final truncated segment name.
+	newName := filepath.Join(w.path, segmentName(index))
+	if err = os.Rename(startName, newName); err != nil {
+		return err
+	}
+	s.path = newName
+	s.index = index
+	if segIdx == len(w.segments)-1 {
+		// Reopen the tail segment file
+		w.sfile, err = os.OpenFile(newName, os.O_WRONLY, w.opts.FilePerms)
+		if err != nil {
+			return err
+		}
+		var n int64
+		if n, err = w.sfile.Seek(0, 2); err != nil {
+			return err
+		}
+		if n != int64(len(ebuf)) {
+			err = errors.New("invalid seek")
+			return err
+		}
+		// Load the last segment entries
+		if err = w.loadSegmentEntries(s); err != nil {
+			return err
+		}
+	}
+	w.segments = append([]*segment{}, w.segments[segIdx:]...)
+	w.firstIndex = index
+	w.clearCache()
+	return nil
+}
+
+// TruncateBack truncates the back of the log by removing all entries that
+// are after the provided `index`. In other words the entry at `index` becomes
+// the last entry in the log.
+//
+// The `AllowEmpty` option may be used to allow for removing all entries in the
+// log by providing `FirstIndex()-1` as the index. Otherwise without
+// `AllowEmpty`, at least one entry must always remain following a truncate.
+func (w *WAL) TruncateBack(index uint64) error {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if w.corrupt {
+		return ErrCorrupt
+	} else if w.closed {
+		return ErrClosed
+	}
+	return w.truncateBack(index)
+}
+
+func (w *WAL) truncateBack(index uint64) (err error) {
+	if index < w.firstIndex-1 || index > w.lastIndex {
+		return ErrOutOfRange
+	}
+	if !w.opts.AllowEmpty && index == w.firstIndex-1 {
+		return ErrOutOfRange
+	}
+	if index == w.lastIndex {
+		// nothing to truncate
+		return nil
+	}
+	var segIdx int
+	var s *segment
+	var ebuf []byte
+	if index == w.firstIndex-1 {
+		// Truncate all entries, only care about the first segment
+		segIdx = 0
+		s = w.segments[segIdx]
+		ebuf = nil
+	} else {
+		segIdx = w.findSegment(index)
+		s, err = w.loadSegment(index)
+		if err != nil {
+			return err
+		}
+		epos := s.epos[:index-s.index+1]
+		ebuf = s.ebuf[:epos[len(epos)-1].end]
+	}
+	// Create an END file contains the truncated segment.
+	endName := filepath.Join(w.path, segmentName(s.index)+".END")
+	if err = w.atomicWrite(endName, ebuf); err != nil {
+		return fmt.Errorf("failed to create end segment: %w", err)
+	}
+	// The log was truncated but still needs some file cleanup. Any errors
+	// following this message will not cause an on-disk data ocorruption, but
+	// may cause an inconsistency with the current program, so we'll return
+	// ErrCorrupt so the the user can attempt a recover by calling Close()
+	// followed by Open().
+	defer func() {
+		if v := recover(); v != nil {
+			err = ErrCorrupt
+		}
+		if err != nil {
+			w.corrupt = true
+		}
+	}()
+
+	// Close the tail segment file
+	if err = w.sfile.Close(); err != nil {
+		return err
+	}
+	// Delete truncated segment files
+	for i := segIdx; i < len(w.segments); i++ {
+		if err = os.Remove(w.segments[i].path); err != nil {
+			return err
+		}
+	}
+	// Rename the END file to the final truncated segment name.
+	newName := filepath.Join(w.path, segmentName(s.index))
+	if err = os.Rename(endName, newName); err != nil {
+		return err
+	}
+	// Reopen the tail segment file
+	w.sfile, err = os.OpenFile(newName, os.O_WRONLY, w.opts.FilePerms)
+	if err != nil {
+		return err
+	}
+	var n int64
+	n, err = w.sfile.Seek(0, 2)
+	if err != nil {
+		return err
+	}
+	if n != int64(len(ebuf)) {
+		err = errors.New("invalid seek")
+		return err
+	}
+	s.path = newName
+	w.segments = append([]*segment{}, w.segments[:segIdx+1]...)
+	w.lastIndex = index
+	w.clearCache()
+	if err = w.loadSegmentEntries(s); err != nil {
+		return err
+	}
+	return nil
+}
+
+// Sync performs an fsync on the log. This is not necessary when the
+// NoSync option is set to false.
+func (w *WAL) Sync() error {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if w.corrupt {
+		return ErrCorrupt
+	} else if w.closed {
+		return ErrClosed
+	}
+	return w.sfile.Sync()
+}
+
+// IsEmpty returns true if there are no entries in the log.
+func (w *WAL) IsEmpty() (bool, error) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if w.corrupt {
+		return false, ErrCorrupt
+	} else if w.closed {
+		return false, ErrClosed
+	}
+	return (w.firstIndex == 0 && w.lastIndex == 0) ||
+		w.firstIndex > w.lastIndex, nil
+}

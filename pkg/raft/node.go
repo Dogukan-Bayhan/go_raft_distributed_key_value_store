@@ -2,8 +2,12 @@ package raft
 
 import (
 	"context"
+	"fmt"
 	"log"
 	"math/rand"
+	"os"
+	"path/filepath"
+	"raft/pkg/storage"
 	"sync/atomic"
 	"time"
 )
@@ -81,14 +85,14 @@ type Node struct {
 	Peers []int
 	Role  Role
 
-	Log         []LogEntry
-	// Last applied is the index number that 
+	Log []LogEntry
+	// Last applied is the index number that
 	// the last occurence inde in the log entry
 	// LastApplied must <= CommitIndex
 	LastApplied uint64
 
 	// These are used by only leader
-	NextIndex  map[int]uint64 
+	NextIndex  map[int]uint64
 	MatchIndex map[int]uint64
 
 	CommitIndex uint64
@@ -102,9 +106,33 @@ type Node struct {
 
 	Router  *LocalRouter
 	Pending map[uint64]chan []byte
+
+	// Write a head log from storage directory
+	// wal used for real index information for node
+	// and also real write and read functionality is
+	// methods of the WAL structure
+	wal *storage.WAL
 }
 
 func NewNode(id int, peers []int, r *LocalRouter) *Node {
+	basePath, _ := filepath.Abs(filepath.Join("pkg", "storage", "wal"))
+	os.MkdirAll(basePath, 0755)
+
+	path := filepath.Join(basePath, fmt.Sprintf("node-%d", id))
+	os.MkdirAll(path, 0755)
+
+	opts := storage.Options{
+		SegmentSize: 20 * 1024 * 1024,
+		AllowEmpty:  true,
+		NoSync:      false,
+		FilePerms:   0644,
+	}
+
+	wal, err := storage.Open(path, &opts)
+	if err != nil {
+		log.Fatalf("[n%d] failed to open WAL: %v", id, err)
+	}
+
 	rand.Seed(time.Now().UnixNano())
 	n := &Node{
 		Id:              id,
@@ -122,6 +150,7 @@ func NewNode(id int, peers []int, r *LocalRouter) *Node {
 		LastIndex:       0,
 		LastTerm:        0,
 		Pending:         make(map[uint64]chan []byte),
+		wal:             wal,
 	}
 
 	return n
@@ -157,7 +186,7 @@ func (n *Node) Run(ctx context.Context) {
 	}
 }
 
-// This is the timer that used by leader to send a heartbeat to the 
+// This is the timer that used by leader to send a heartbeat to the
 // followers or candidates to tell them leader Node is still alive
 func (n *Node) heartbeatTick() <-chan time.Time {
 	if n.HeartbeatTicker == nil {
@@ -167,7 +196,6 @@ func (n *Node) heartbeatTick() <-chan time.Time {
 
 	return n.HeartbeatTicker.C
 }
-
 
 // If the timer of the Node is send message Nodes try to start
 // an election and request vote from all peers
@@ -210,12 +238,11 @@ func (n *Node) startElection() {
 	n.resetElection()
 }
 
-
 // If candidate have enough vote set itself as a leader
 func (n *Node) becomeLeader() {
 	n.Role = Leader
 
-	// Close its timer if this timer is not nil than 
+	// Close its timer if this timer is not nil than
 	// after a time leader start a new election for itself
 	if n.ElectionTimer != nil {
 		if !n.ElectionTimer.Stop() {
@@ -227,8 +254,8 @@ func (n *Node) becomeLeader() {
 	}
 
 	// After every election leader set index to log replication
-	// Next Index is starting from last log index + 1 and 
-	// decreased by 1 if followers logs index is lesser than the 
+	// Next Index is starting from last log index + 1 and
+	// decreased by 1 if followers logs index is lesser than the
 	// leaders log index
 	n.NextIndex = make(map[int]uint64, len(n.Peers))
 	n.MatchIndex = make(map[int]uint64, len(n.Peers))
@@ -274,8 +301,6 @@ func (n *Node) resetElection() {
 	n.ElectionTimer.Reset(jitterElection())
 }
 
-
-// 
 func (n *Node) handleRPC(m RpcMessage) {
 	switch msg := m.Body.(type) {
 	case AppendEntries:
@@ -291,7 +316,7 @@ func (n *Node) handleRPC(m RpcMessage) {
 	}
 }
 
-// After vote request if followers term is greater than 
+// After vote request if followers term is greater than
 // candidates term candidate becomes follower again
 // If candidate is suitable to become leader and also
 // vote is masjority then Node become a leader
@@ -552,4 +577,3 @@ func (n *Node) ReplicateTo(peer int) {
 	}
 	n.sendRPC(RpcMessage{From: n.Id, To: peer, Body: req})
 }
-

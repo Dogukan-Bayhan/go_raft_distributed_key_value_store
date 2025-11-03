@@ -112,7 +112,7 @@ type Node struct {
 	// wal used for real index information for node
 	// and also real write and read functionality is
 	// methods of the WAL structure
-	wal *storage.WAL
+	Wal *storage.WAL
 }
 
 
@@ -183,7 +183,7 @@ func NewNode(id int, peers []int, r *LocalRouter) (*Node, error) {
 		LastIndex:       walLastIndex,
 		LastTerm:        lastTerm,
 		Pending:         make(map[uint64]chan []byte),
-		wal:             wal,
+		Wal:             wal,
 	}
 
 	n.loadFromWAL()
@@ -197,11 +197,11 @@ func NewNode(id int, peers []int, r *LocalRouter) (*Node, error) {
 // index, skips any corrupted or unreadable entries, and restores a valid
 // Log slice beginning with an initial barrier entry at index 0.
 func (n *Node) loadFromWAL() error  {
-	first, err := n.wal.FirstIndex()
+	first, err := n.Wal.FirstIndex()
 	if err != nil {
 		return err
 	}
-	last, err := n.wal.LastIndex()
+	last, err := n.Wal.LastIndex()
 	if err != nil {
 		return err
 	}
@@ -215,7 +215,7 @@ func (n *Node) loadFromWAL() error  {
 	}
 
 	for i := first; i <= last; i++ {
-		data, err := n.wal.Read(i)
+		data, err := n.Wal.Read(i)
 		if err != nil {
 			log.Printf("[n%d] skip corrupt WAL entry %d: %v", n.Id, i, err)
             continue
@@ -231,15 +231,15 @@ func (n *Node) loadFromWAL() error  {
 	return nil
 }
 
-// jitterElection returns a randomized election timeout between 300ms and 600ms.
+// jitterElection returns a randomized election timeout between 400ms and 1100ms.
 // Raft uses this randomization so that followers do not start elections
 // at the same time (avoiding split votes). Each node gets a slightly different
 // timeout duration to improve cluster stability.
 // Also you change duration multiplyer for your own project
 func jitterElection() time.Duration {
-	durationMultiplyer := 300
-
-	return time.Duration(durationMultiplyer)*time.Millisecond + time.Duration(rand.Intn(durationMultiplyer))*time.Millisecond
+	base := 400
+	return time.Duration(base)*time.Millisecond +
+	       time.Duration(rand.Intn(700))*time.Millisecond
 }
 
 func (n *Node) Run(ctx context.Context) {
@@ -447,24 +447,60 @@ func (n *Node) handleAppendEntries(from int, req AppendEntries) {
 	if req.LastLogIndex > 0 {
 		t, ok := n.TermAt(req.LastLogIndex)
 		if !ok || t != req.LastLogTerm {
-			n.Log = n.Log[:req.LastLogIndex+1]
+			// truncate RAM log
+			if int(req.LastLogIndex+1) < len(n.Log) {
+				n.Log = n.Log[:req.LastLogIndex+1]
+			}
+			// truncate WAL on disk
+			if err := n.Wal.TruncateBack(req.LastLogIndex + 1); err != nil {
+				log.Printf("[n%d] WAL truncate failed at %d: %v", n.Id, req.LastLogIndex, err)
+			}
 			n.LastIndex, n.LastTerm = n.LastLogIndex(), n.LastLogTerm()
-			n.sendRPC(RpcMessage{From: n.Id, To: from, Body: AppendEntriesResponse{
-				Term: atomic.LoadUint64(&n.CurrentTerm), Success: false, LastIndex: n.LastLogIndex(),
-			}})
+
+			n.sendRPC(RpcMessage{
+				From: n.Id,
+				To:   from,
+				Body: AppendEntriesResponse{
+					Term:      atomic.LoadUint64(&n.CurrentTerm),
+					Success:   false,
+					LastIndex: n.LastLogIndex(),
+				},
+			})
 			return
 		}
 	}
 
+	// Append new log entries (if any)
 	if len(req.Entries) > 0 {
 		insertAt := req.LastLogIndex + 1
 		if insertAt <= n.LastLogIndex() {
+			// truncate conflicting entries
 			n.Log = n.Log[:insertAt]
+			if err := n.Wal.TruncateBack(insertAt); err != nil {
+				log.Printf("[n%d] WAL truncate during overwrite failed: %v", n.Id, err)
+			}
 		}
-		n.Log = append(n.Log, req.Entries...)
-		n.LastIndex, n.LastTerm = n.LastLogIndex(), n.LastLogTerm()
+
+		for _, e := range req.Entries {
+			// Write entry to WAL (durable)
+			data, err := json.Marshal(e)
+			if err != nil {
+				log.Printf("[n%d] failed to marshal entry %d: %v", n.Id, e.Index, err)
+				continue
+			}
+			if err := n.Wal.Write(e.Index, data); err != nil {
+				log.Printf("[n%d] failed to write WAL entry %d: %v", n.Id, e.Index, err)
+				continue
+			}
+
+			// Append to RAM log
+			n.Log = append(n.Log, e)
+			n.LastIndex = e.Index
+			n.LastTerm = e.Term
+		}
 	}
 
+	// Apply committed entries to state machine
 	if req.LeaderCommit > n.CommitIndex {
 		hi := n.LastLogIndex()
 		if req.LeaderCommit < hi {
@@ -483,7 +519,7 @@ func (n *Node) handleAppendEntries(from int, req AppendEntries) {
 	n.sendRPC(RpcMessage{From: n.Id, To: from, Body: AppendEntriesResponse{
 		Term:      atomic.LoadUint64(&n.CurrentTerm),
 		Success:   true,
-		LastIndex: 0,
+		LastIndex: n.LastLogIndex(),
 	}})
 }
 

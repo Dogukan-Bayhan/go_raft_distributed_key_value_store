@@ -145,6 +145,10 @@ type batchEntry struct {
 	size  int
 }
 
+
+// Open opens (or creates) a WAL at the given path, recovering existing segment files,
+// repairing incomplete START/END segments if present, and returning a ready-to-use WAL
+// instance for appending and reading log entries.
 func Open(path string, opts *Options) (*WAL, error) {
 	// If user don't give any option function use
 	// default options as opts
@@ -219,6 +223,10 @@ func Open(path string, opts *Options) (*WAL, error) {
 		w.lastIndex = 0
 		w.sfile, err = os.OpenFile(w.segments[0].path,
 			os.O_CREATE|os.O_RDWR|os.O_TRUNC, w.opts.FilePerms)
+
+		if err != nil {
+			return nil, err
+		}
 		return w, nil
 	}
 
@@ -291,13 +299,6 @@ func Open(path string, opts *Options) (*WAL, error) {
 	}
 
 	return w, nil
-}
-
-func abs(path string) (string, error) {
-	if path == ":memory:" {
-		return "", errors.New("in-memory log not supported")
-	}
-	return filepath.Abs(path)
 }
 
 

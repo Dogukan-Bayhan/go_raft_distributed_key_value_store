@@ -121,7 +121,7 @@ type Node struct {
 // then create a new node respect to these index, term and other necessary initial values
 // Finally read all entries in the persistence log then write it to the n.Log
 func NewNode(id int, peers []int, r *LocalRouter) (*Node, error) {
-	//
+	// Make sure that created folders will stored in /pkg/storage/wal
 	basePath, _ := filepath.Abs(filepath.Join("pkg", "storage", "wal"))
 	err := os.MkdirAll(basePath, 0755)
 
@@ -129,6 +129,7 @@ func NewNode(id int, peers []int, r *LocalRouter) (*Node, error) {
 		return nil, err
 	}
 
+	// Create a dynamic named folder respect to the nodes id
 	path := filepath.Join(basePath, fmt.Sprintf("node-%d", id))
 	err = os.MkdirAll(path, 0755)
 
@@ -190,6 +191,11 @@ func NewNode(id int, peers []int, r *LocalRouter) (*Node, error) {
 	return n, nil
 }
 
+
+// loadFromWAL rebuilds the node’s in-memory log by reading and decoding
+// all persisted entries from the WAL. It starts from the first recorded
+// index, skips any corrupted or unreadable entries, and restores a valid
+// Log slice beginning with an initial barrier entry at index 0.
 func (n *Node) loadFromWAL() error  {
 	first, err := n.wal.FirstIndex()
 	if err != nil {

@@ -109,7 +109,7 @@ var DefaultOptions = &Options{
 
 type WAL struct {
 	mu         sync.RWMutex
-	path       string      // absolute path to log directory
+	Path       string      // absolute path to log directory
 	opts       Options     // log options
 	closed     bool        // log is closed
 	corrupt    bool        // log may be corrupt
@@ -170,7 +170,7 @@ func Open(path string, opts *Options) (*WAL, error) {
 	if err != nil {
 		return nil, err
 	}
-	w := &WAL{path: path, opts: *opts}
+	w := &WAL{Path: path, opts: *opts, mu: sync.RWMutex{}, segments: []*segment{}}
 	w.scache.Resize(opts.SegmentCacheSize)
 
 	err = os.MkdirAll(path, opts.DirPerms)
@@ -178,7 +178,7 @@ func Open(path string, opts *Options) (*WAL, error) {
 		return nil, err
 	}
 
-	files, err := os.ReadDir(w.path)
+	files, err := os.ReadDir(w.Path)
 	if err != nil {
 		return nil, err
 	}
@@ -205,21 +205,21 @@ func Open(path string, opts *Options) (*WAL, error) {
 			}
 			w.segments = append(w.segments, &segment{
 				index: index,
-				path:  filepath.Join(w.path, name),
+				path:  filepath.Join(w.Path, name),
 			})
 		}
 	}
 	if len(w.segments) == 0 {
 		w.segments = append(w.segments, &segment{
 			index: 1,
-			path:  filepath.Join(w.path, segmentName(1)),
+			path:  filepath.Join(w.Path, segmentName(1)),
 		})
 
 		w.firstIndex = 1
 		w.lastIndex = 0
 		w.sfile, err = os.OpenFile(w.segments[0].path,
 			os.O_CREATE|os.O_RDWR|os.O_TRUNC, w.opts.FilePerms)
-		return nil, err
+		return w, nil
 	}
 
 	if startIdx != -1 {
@@ -441,7 +441,7 @@ func (w *WAL) cycle() error {
 	w.pushCache(len(w.segments) - 1)
 	s := &segment {
 		index: w.lastIndex + 1,
-		path:  filepath.Join(w.path, segmentName(w.lastIndex+1)),
+		path:  filepath.Join(w.Path, segmentName(w.lastIndex+1)),
 	}
 	w.sfile, err = os.OpenFile(s.path, os.O_CREATE|os.O_RDWR|os.O_TRUNC, w.opts.FilePerms)
 
@@ -989,7 +989,7 @@ func (w *WAL) truncateFront(index uint64) (err error) {
 		ebuf = s.ebuf[epos[0].pos:]
 	}
 	// Create a START file contains the truncated segment.
-	startName := filepath.Join(w.path, segmentName(index)+".START")
+	startName := filepath.Join(w.Path, segmentName(index)+".START")
 	if err = w.atomicWrite(startName, ebuf); err != nil {
 		return fmt.Errorf("failed to create start segment: %w", err)
 	}
@@ -1019,7 +1019,7 @@ func (w *WAL) truncateFront(index uint64) (err error) {
 		}
 	}
 	// Rename the START file to the final truncated segment name.
-	newName := filepath.Join(w.path, segmentName(index))
+	newName := filepath.Join(w.Path, segmentName(index))
 	if err = os.Rename(startName, newName); err != nil {
 		return err
 	}
@@ -1097,7 +1097,7 @@ func (w *WAL) truncateBack(index uint64) (err error) {
 		ebuf = s.ebuf[:epos[len(epos)-1].end]
 	}
 	// Create an END file contains the truncated segment.
-	endName := filepath.Join(w.path, segmentName(s.index)+".END")
+	endName := filepath.Join(w.Path, segmentName(s.index)+".END")
 	if err = w.atomicWrite(endName, ebuf); err != nil {
 		return fmt.Errorf("failed to create end segment: %w", err)
 	}
@@ -1126,7 +1126,7 @@ func (w *WAL) truncateBack(index uint64) (err error) {
 		}
 	}
 	// Rename the END file to the final truncated segment name.
-	newName := filepath.Join(w.path, segmentName(s.index))
+	newName := filepath.Join(w.Path, segmentName(s.index))
 	if err = os.Rename(endName, newName); err != nil {
 		return err
 	}

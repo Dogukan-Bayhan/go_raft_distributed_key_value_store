@@ -115,7 +115,13 @@ type Node struct {
 	wal *storage.WAL
 }
 
+
+// New node method first load indexes from write a head log
+// then get last term from the last index
+// then create a new node respect to these index, term and other necessary initial values
+// Finally read all entries in the persistence log then write it to the n.Log
 func NewNode(id int, peers []int, r *LocalRouter) (*Node, error) {
+	//
 	basePath, _ := filepath.Abs(filepath.Join("pkg", "storage", "wal"))
 	err := os.MkdirAll(basePath, 0755)
 
@@ -179,7 +185,44 @@ func NewNode(id int, peers []int, r *LocalRouter) (*Node, error) {
 		wal:             wal,
 	}
 
+	n.loadFromWAL()
+
 	return n, nil
+}
+
+func (n *Node) loadFromWAL() error  {
+	first, err := n.wal.FirstIndex()
+	if err != nil {
+		return err
+	}
+	last, err := n.wal.LastIndex()
+	if err != nil {
+		return err
+	}
+
+	n.Log = []LogEntry{
+		{
+			Term: 0,
+			Index: 0,
+			Type: EntryBarrier,
+		},
+	}
+
+	for i := first; i <= last; i++ {
+		data, err := n.wal.Read(i)
+		if err != nil {
+			log.Printf("[n%d] skip corrupt WAL entry %d: %v", n.Id, i, err)
+            continue
+		}
+
+		var e LogEntry
+        if err := json.Unmarshal(data, &e); err != nil {
+            continue
+        }
+        n.Log = append(n.Log, e)
+	}
+
+	return nil
 }
 
 // jitterElection returns a randomized election timeout between 300ms and 600ms.

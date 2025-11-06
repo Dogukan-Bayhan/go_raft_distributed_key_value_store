@@ -1,3 +1,39 @@
+Raft-Based Key-Value Store (Go)
+
+This project is a distributed key-value store built from scratch using the Raft consensus algorithm.  
+It implements a custom Write-Ahead Log (WAL) for durability and prepares the foundation for an upcoming Finite State Machine (FSM) and RPC communication layer.  
+All components are written in Go with a strong focus on reliability, fault-tolerance, and modularity.
+
+---
+
+## Current Functionalities
+
+ **Write-Ahead Log (WAL)**  
+- Appends, reads, and persists log entries to disk.  
+- Supports sequential recovery and integrity validation.  
+- Designed for monotonic log index growth (simplifies recovery and snapshotting).  
+
+ **Raft Core Setup (Initial)**  
+- Log entry handling integrated with WAL.  
+- Placeholder hooks for FSM application and snapshot logic.  
+- Prepares the structure for leader election and replication.
+
+ **Planned Next Steps**  
+- Implement FSM (`fsm/apply.go`, `fsm/snapshot.go`) for applying commands (PUT, DELETE, GET, ...).  
+- Introduce periodic snapshotting for recovery beyond WAL.  
+- Add RPC layer for node communication and log synchronization.  
+
+---
+
+## Running Tests
+
+You can run all test suites (unit + integration) using:
+
+```bash
+go test ./... -v
+
+
+
 ## Acknowledgements
 
 The WAL (Write-Ahead Log) component of this project was inspired by [tidwall/wal](https://github.com/tidwall/wal) by Josh Baker.

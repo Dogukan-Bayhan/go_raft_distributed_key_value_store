@@ -53,6 +53,14 @@ type Metrics struct {
 
 type Storage interface {
 	Get(key []byte) ([]byte, bool, error)
+	Put(key []byte, value []byte) error
+	Delete(key []byte) error
+
+	Snaphsot() (map[string][]byte, error)
+	Restore(data map[string][]byte) error
+
+	Flush() error
+	Close() error
 }
 
 type FSM struct {

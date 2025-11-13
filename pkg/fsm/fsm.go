@@ -29,7 +29,7 @@ func (f *FSM) Apply(msg ApplyMsg) interface{} {
 // --- METRICS ---
 
 func (f *FSM) updateMetrics(cmd Command) {
-    // Şimdilik boş
+    // Empty now
 }
 
 // --- APPLY OPERATIONS ---

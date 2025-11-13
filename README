@@ -44,6 +44,23 @@ You can run all test suites (unit + integration) using:
 go test ./... -v
 
 
+## Technical
+
+### Read Consistency (Draft)
+
+The system currently supports follower-based read operations for performance.
+Follower reads are correct but not linearizable. This means:
+
+- All followers apply only committed Raft log entries (state is always valid).
+- However, followers may temporarily lag behind the leader.
+- A GET issued to a follower may return a slightly outdated value (stale read).
+
+Leader reads are fully linearizable. Follower reads provide higher throughput
+but do not guarantee that the returned value reflects the most recent write.
+
+
+
+
 
 ## Acknowledgements
 

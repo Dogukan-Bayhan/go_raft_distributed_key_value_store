@@ -1,3 +1,14 @@
+# Raft Implementation (Work in Progress)
+This branch contains the experimental development of:
+- WAL storage layer
+- Snapshot mechanism
+- FSM apply pipeline
+- Log structure and monotonic indexes
+
+Not production-ready. Actively being designed and tested.
+
+
+
 Raft-Based Key-Value Store (Go)
 
 This project is a distributed key-value store built from scratch using the Raft consensus algorithm.  

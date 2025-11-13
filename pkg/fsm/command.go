@@ -33,3 +33,11 @@ func EncodeCommand(cmd Command) ([]byte, error) {
 	}
 	return buf.Bytes(), nil
 }
+
+func DecodeCommand(b []byte) (Command, error) {
+	var cmd Command
+	if err := gob.NewDecoder(bytes.NewReader(b)).Decode(&cmd); err != nil {
+		return Command{}, err
+	}
+	return cmd, nil
+}

@@ -131,6 +131,7 @@ type Storage interface {
     Get(key []byte) ([]byte, bool, error)
     Put(key []byte, value []byte) error
     Delete(key []byte) error
+    CAS(key []byte, expected []byte ,value []byte) (error, bool)
 
     Snaphsot() (map[string][]byte, error)
     Restore(data map[string][]byte) error
@@ -156,6 +157,8 @@ type Storage interface {
 // Metrics: Runtime statistics for monitoring/telemetry.
 //
 type FSM struct {
-    Storage *Storage
+    Storage Storage
     Metrics *Metrics
+
+    LastApplied uint64
 }

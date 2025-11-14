@@ -6,7 +6,7 @@ import (
 )
 
 type BTreeStorage struct {
-	mu sync.RWMutex
+	Mu sync.RWMutex
 	// tree *btree.BTree
-	file *os.File
+	File *os.File
 }

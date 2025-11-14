@@ -46,7 +46,7 @@ go test ./... -v
 
 ## Technical
 
-### Read Consistency (Draft)
+### Read Consistency 
 
 The system currently supports follower-based read operations for performance.
 Follower reads are correct but not linearizable. This means:
@@ -58,6 +58,20 @@ Follower reads are correct but not linearizable. This means:
 Leader reads are fully linearizable. Follower reads provide higher throughput
 but do not guarantee that the returned value reflects the most recent write.
 
+### Client Request Routing & Redirect Response Model
+
+This KV-store uses a Redirect Response Model to route client requests efficiently and consistently across the Raft cluster.
+This model is a widely-used industry standard, employed by systems such as Etcd, Consul.
+
+The goals of this design are:
+
+Low-latency reads by allowing followers to serve GET requests
+
+Strong consistency for writes by ensuring PUT/DELETE/CAS/BATCH operations are handled only by the current leader
+
+Simple and transparent failover through automatic client-side redirection
+
+Clear separation between internal Raft communication and external client API
 
 
 

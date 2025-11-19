@@ -10,45 +10,69 @@ import (
 	"time"
 )
 
+// CreateSnapshot serializes the FSM's deterministic state into a durable,
+// verifiable snapshot file. Snapshots allow the system to discard old WAL
+// segments and perform fast crash recovery.
+//
+// The snapshot file has the following footer-oriented binary layout:
+//
+//   [ META_BYTES ][ META_SIZE ][ META_CHECKSUM ]
+//   [ DATA_BYTES ][ DATA_SIZE ][ DATA_CHECKSUM ]
+//
+// Footers (SIZE + CHECKSUM) are written immediately *after* each block so
+// RestoreSnapshot can seek from the end of the file and locate blocks in
+// O(1) time without scanning. This is a standard design used in LSM/raft
+// storage engines.
+//
+// META block:
+//   - Contains SnapshotMeta (last applied index, term, timestamp, etc.)
+// DATA block:
+//   - Full serialized KV-state returned by Storage.Snapshot()
+//
+// Both blocks are gob-encoded and protected using CRC32-IEEE checksums.
+// If either checksum does not match during restoration, the snapshot is
+// considered corrupted and rejected.
 func (f *FSM) CreateSnapshot(path string, meta SnapshotMeta) error {
 
-	kv, err := f.Storage.Snaphsot()
-	if err != nil {
-		return err
-	}
+    // Capture a consistent KV view from the storage backend.
+    kv, err := f.Storage.Snaphsot()
+    if err != nil {
+        return err
+    }
 
-	meta.Created = time.Now()
+    // Timestamp the snapshot. Raft will fill Index and Term.
+    meta.Created = time.Now()
 
-	metaBuf := new(bytes.Buffer)
+    // --- Encode META block ---
+    metaBuf := new(bytes.Buffer)
+    if err := gob.NewEncoder(metaBuf).Encode(meta); err != nil {
+        return err
+    }
+    metaBytes := metaBuf.Bytes()
+    metaSize := uint32(len(metaBytes))
+    metaChecksum := crc32.ChecksumIEEE(metaBytes)
 
-	if err := gob.NewEncoder(metaBuf).Encode(meta); err != nil {
-		return err
-	}
+    // --- Encode DATA block ---
+    dataBuf := new(bytes.Buffer)
+    if err := gob.NewEncoder(dataBuf).Encode(kv); err != nil {
+        return err
+    }
+    dataBytes := dataBuf.Bytes()
+    dataSize := uint32(len(dataBytes))
+    dataChecksum := crc32.ChecksumIEEE(dataBytes)
 
-	metaBytes :=  metaBuf.Bytes()
-	metaSize := uint32(len(metaBytes))
-	metaChecksum := crc32.ChecksumIEEE(metaBytes)
+    // Snapshot file name includes the last applied index to maintain ordering.
+    fpath := fmt.Sprintf("%s/snapshot_%d.snap", path, meta.Index)
 
-	dataBuf := new(bytes.Buffer)
-	if err := gob.NewEncoder(dataBuf).Encode(kv); err != nil {
-		return err
-	}
+    file, err := os.OpenFile(fpath, os.O_CREATE|os.O_RDWR|os.O_TRUNC, 0644)
+    if err != nil {
+        return err
+    }
+    defer file.Close()
 
-	dataBytes := dataBuf.Bytes()
-	dataSize := uint32(len(dataBytes))
-	dataChecksum := crc32.ChecksumIEEE(dataBytes)
-
-
-	fpath := fmt.Sprintf("%s/snapshot_%d.snap", path, meta.Index)
-	file, err := os.OpenFile(fpath, os.O_CREATE | os.O_RDWR | os.O_TRUNC, 0644)
-
-	if err != nil {
-		return err
-	}
-
-	defer file.Close()
-
-	if _, err := file.Write(metaBytes); err != nil {
+    // --- Write META block ---
+    // Layout: [metaBytes][metaSize][metaChecksum]
+    if _, err := file.Write(metaBytes); err != nil {
         return err
     }
     if err := writeUint32(file, metaSize); err != nil {
@@ -58,7 +82,8 @@ func (f *FSM) CreateSnapshot(path string, meta SnapshotMeta) error {
         return err
     }
 
-    // --- DATA ---
+    // --- Write DATA block ---
+    // Layout: [dataBytes][dataSize][dataChecksum]
     if _, err := file.Write(dataBytes); err != nil {
         return err
     }
@@ -72,70 +97,88 @@ func (f *FSM) CreateSnapshot(path string, meta SnapshotMeta) error {
     return nil
 }
 
+// RestoreSnapshot loads a snapshot from disk, verifies its integrity,
+// decodes META and DATA blocks, and installs the KV-state into the FSM.
+// The layout is parsed backwards to achieve constant-time block detection:
+//
+//   from end → DATA_CHECKSUM → DATA_SIZE → DATA_BYTES
+//             META_CHECKSUM → META_SIZE → META_BYTES
+//
+// This avoids scanning the file and is the standard approach used by
+// RocksDB, Badger, and Hashicorp Raft.
 func (f *FSM) RestoreSnapshot(path string) (*SnapshotMeta, error) {
+
     file, err := os.Open(path)
     if err != nil {
         return nil, err
     }
     defer file.Close()
 
+    // Read entire snapshot into memory (snapshot files are typically small).
     buf, err := io.ReadAll(file)
     if err != nil {
         return nil, err
     }
-
     r := bytes.NewReader(buf)
 
+    // --- Read DATA footer ---
     dataChecksum, err := readUint32FromEnd(r)
     if err != nil {
         return nil, err
     }
-
-	dataSize, err := readUint32FromEnd(r)
+    dataSize, err := readUint32FromEnd(r)
     if err != nil {
         return nil, err
     }
 
-    end := len(buf) - 8
-    dataStart := end - int(dataSize)
-    dataBytes := buf[dataStart:end]
+    // Compute byte ranges for DATA block.
+    dataEnd := len(buf) - 8
+    dataStart := dataEnd - int(dataSize)
+    dataBytes := buf[dataStart:dataEnd]
 
+    // Validate DATA checksum.
     if crc32.ChecksumIEEE(dataBytes) != dataChecksum {
         return nil, fmt.Errorf("snapshot corrupted: data checksum mismatch")
     }
 
+    // Decode KV-state.
     var kv map[string][]byte
     if err := gob.NewDecoder(bytes.NewReader(dataBytes)).Decode(&kv); err != nil {
         return nil, err
     }
 
+    // --- Read META footer ---
     metaChecksum, err := readUint32FromEnd(r)
     if err != nil {
         return nil, err
     }
-
-	metaSize, err := readUint32FromEnd(r)
+    metaSize, err := readUint32FromEnd(r)
     if err != nil {
         return nil, err
     }
 
+    // Compute byte ranges for META block.
     metaEnd := dataStart - 8
     metaStart := metaEnd - int(metaSize)
     metaBytes := buf[metaStart:metaEnd]
 
+    // Validate META checksum.
     if crc32.ChecksumIEEE(metaBytes) != metaChecksum {
         return nil, fmt.Errorf("snapshot corrupted: meta checksum mismatch")
     }
 
+    // Decode snapshot metadata.
     var meta SnapshotMeta
     if err := gob.NewDecoder(bytes.NewReader(metaBytes)).Decode(&meta); err != nil {
         return nil, err
     }
 
+    // Reinstall KV-state into the storage backend.
     if err := f.Storage.Restore(kv); err != nil {
         return nil, err
     }
 
+    // Update FSM apply pointer.
     f.LastApplied = meta.Index
 
     return &meta, nil

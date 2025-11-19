@@ -27,7 +27,7 @@ func (f *FSM) CreateSnapshot(path string, meta SnapshotMeta) error {
 
 	metaBytes :=  metaBuf.Bytes()
 	metaSize := uint32(len(metaBytes))
-	metaChechksum := crc32.ChecksumIEEE(metaBytes)
+	metaChecksum := crc32.ChecksumIEEE(metaBytes)
 
 	dataBuf := new(bytes.Buffer)
 	if err := gob.NewEncoder(dataBuf).Encode(kv); err != nil {
@@ -35,7 +35,7 @@ func (f *FSM) CreateSnapshot(path string, meta SnapshotMeta) error {
 	}
 
 	dataBytes := dataBuf.Bytes()
-	dataSize() := uint32(len(dataBytes))
+	dataSize := uint32(len(dataBytes))
 	dataChecksum := crc32.ChecksumIEEE(dataBytes)
 
 
@@ -48,7 +48,7 @@ func (f *FSM) CreateSnapshot(path string, meta SnapshotMeta) error {
 
 	defer file.Close()
 
-	 if _, err := file.Write(metaBytes); err != nil {
+	if _, err := file.Write(metaBytes); err != nil {
         return err
     }
     if err := writeUint32(file, metaSize); err != nil {
@@ -71,6 +71,90 @@ func (f *FSM) CreateSnapshot(path string, meta SnapshotMeta) error {
 
     return nil
 }
+
+func (f *FSM) RestoreSnapshot(path string) (*SnapshotMeta, error) {
+    file, err := os.Open(path)
+    if err != nil {
+        return nil, err
+    }
+    defer file.Close()
+
+    // Dosyanın tamamını oku
+    buf, err := io.ReadAll(file)
+    if err != nil {
+        return nil, err
+    }
+
+    // Reader üzerinde çalış
+    r := bytes.NewReader(buf)
+
+    // ---------- STEP 1: sondan DATA checksum ve size oku ----------
+    // dataChecksum
+    dataChecksum, err := readUint32FromEnd(r)
+    if err != nil {
+        return nil, err
+    }
+    // dataSize
+    dataSize, err := readUint32FromEnd(r)
+    if err != nil {
+        return nil, err
+    }
+
+    // dataBytes: sondan (size+checksum)
+    end := len(buf) - 8
+    dataStart := end - int(dataSize)
+    dataBytes := buf[dataStart:end]
+
+    // checksum kontrol
+    if crc32.ChecksumIEEE(dataBytes) != dataChecksum {
+        return nil, fmt.Errorf("snapshot corrupted: data checksum mismatch")
+    }
+
+    // decode KV map
+    var kv map[string][]byte
+    if err := gob.NewDecoder(bytes.NewReader(dataBytes)).Decode(&kv); err != nil {
+        return nil, err
+    }
+
+    // ---------- STEP 2: META checksum ve size ----------
+    // metaChecksum
+    metaChecksum, err := readUint32FromEnd(r)
+    if err != nil {
+        return nil, err
+    }
+    // metaSize
+    metaSize, err := readUint32FromEnd(r)
+    if err != nil {
+        return nil, err
+    }
+
+    // metaBytes
+    metaEnd := dataStart - 8
+    metaStart := metaEnd - int(metaSize)
+    metaBytes := buf[metaStart:metaEnd]
+
+    // checksum kontrol
+    if crc32.ChecksumIEEE(metaBytes) != metaChecksum {
+        return nil, fmt.Errorf("snapshot corrupted: meta checksum mismatch")
+    }
+
+    // meta decode
+    var meta SnapshotMeta
+    if err := gob.NewDecoder(bytes.NewReader(metaBytes)).Decode(&meta); err != nil {
+        return nil, err
+    }
+
+    // ---------- STEP 3: Storage restore ----------
+    if err := f.Storage.Restore(kv); err != nil {
+        return nil, err
+    }
+
+    // FSM state güncelle
+    f.LastApplied = meta.Index
+
+    return &meta, nil
+}
+
 
 func writeUint32(w io.Writer, v uint32) error {
     var buf [4]byte

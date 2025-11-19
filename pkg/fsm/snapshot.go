@@ -79,77 +79,63 @@ func (f *FSM) RestoreSnapshot(path string) (*SnapshotMeta, error) {
     }
     defer file.Close()
 
-    // Dosyanın tamamını oku
     buf, err := io.ReadAll(file)
     if err != nil {
         return nil, err
     }
 
-    // Reader üzerinde çalış
     r := bytes.NewReader(buf)
 
-    // ---------- STEP 1: sondan DATA checksum ve size oku ----------
-    // dataChecksum
     dataChecksum, err := readUint32FromEnd(r)
     if err != nil {
         return nil, err
     }
-    // dataSize
-    dataSize, err := readUint32FromEnd(r)
+
+	dataSize, err := readUint32FromEnd(r)
     if err != nil {
         return nil, err
     }
 
-    // dataBytes: sondan (size+checksum)
     end := len(buf) - 8
     dataStart := end - int(dataSize)
     dataBytes := buf[dataStart:end]
 
-    // checksum kontrol
     if crc32.ChecksumIEEE(dataBytes) != dataChecksum {
         return nil, fmt.Errorf("snapshot corrupted: data checksum mismatch")
     }
 
-    // decode KV map
     var kv map[string][]byte
     if err := gob.NewDecoder(bytes.NewReader(dataBytes)).Decode(&kv); err != nil {
         return nil, err
     }
 
-    // ---------- STEP 2: META checksum ve size ----------
-    // metaChecksum
     metaChecksum, err := readUint32FromEnd(r)
     if err != nil {
         return nil, err
     }
-    // metaSize
-    metaSize, err := readUint32FromEnd(r)
+
+	metaSize, err := readUint32FromEnd(r)
     if err != nil {
         return nil, err
     }
 
-    // metaBytes
     metaEnd := dataStart - 8
     metaStart := metaEnd - int(metaSize)
     metaBytes := buf[metaStart:metaEnd]
 
-    // checksum kontrol
     if crc32.ChecksumIEEE(metaBytes) != metaChecksum {
         return nil, fmt.Errorf("snapshot corrupted: meta checksum mismatch")
     }
 
-    // meta decode
     var meta SnapshotMeta
     if err := gob.NewDecoder(bytes.NewReader(metaBytes)).Decode(&meta); err != nil {
         return nil, err
     }
 
-    // ---------- STEP 3: Storage restore ----------
     if err := f.Storage.Restore(kv); err != nil {
         return nil, err
     }
 
-    // FSM state güncelle
     f.LastApplied = meta.Index
 
     return &meta, nil

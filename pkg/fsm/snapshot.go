@@ -5,6 +5,7 @@ import (
 	"encoding/gob"
 	"fmt"
 	"hash/crc32"
+	"io"
 	"os"
 	"time"
 )
@@ -69,4 +70,31 @@ func (f *FSM) CreateSnapshot(path string, meta SnapshotMeta) error {
     }
 
     return nil
+}
+
+func writeUint32(w io.Writer, v uint32) error {
+    var buf [4]byte
+    buf[0] = byte(v >> 24)
+    buf[1] = byte(v >> 16)
+    buf[2] = byte(v >> 8)
+    buf[3] = byte(v)
+    _, err := w.Write(buf[:])
+    return err
+}
+
+func readUint32FromEnd(r *bytes.Reader) (uint32, error) {
+    // sondan 4 byte geri git
+    offset, _ := r.Seek(-4, io.SeekEnd)
+    var buf [4]byte
+    if _, err := r.Read(buf[:]); err != nil {
+        return 0, err
+    }
+    // tekrar 4 byte geri (sonrakine hazırlık)
+    r.Seek(offset, io.SeekStart)
+
+    v := uint32(buf[0])<<24 |
+         uint32(buf[1])<<16 |
+         uint32(buf[2])<<8  |
+         uint32(buf[3])
+    return v, nil
 }
